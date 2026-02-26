@@ -1,0 +1,830 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Opnet Faucet Dispenser</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Orbitron:wght@400;700;900&display=swap" rel="stylesheet">
+
+<!--
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║  CONFIG — update these after running deploy.js + setup-faucet.js ║
+  ╚══════════════════════════════════════════════════════════════════╝
+-->
+<script>
+  window.FAUCET_CONFIG = {
+    // OP_NET JSON-RPC endpoint for Bitcoin Regtest
+    RPC_URL: 'https://regtest.opnet.org',
+
+    // FaucetDispenser contract address (from deployed-addresses.json)
+    FAUCET_CONTRACT: 'PASTE_FAUCET_ADDRESS_HERE',
+
+    // Token contract addresses (from deployed-addresses.json)
+    TOKENS: [
+      { id: 'opnet', name: 'Opnet',     symbol: 'OPNET', address: 'PASTE_OPNET_TOKEN_ADDRESS_HERE', color: '#F7931A', icon: '₿' },
+      { id: 'moto',  name: 'Moto Test', symbol: 'MOTO',  address: 'PASTE_MOTO_TOKEN_ADDRESS_HERE',  color: '#00D4FF', icon: '⚡' },
+      { id: 'rbtc',  name: 'RBTC',      symbol: 'RBTC',  address: 'PASTE_RBTC_TOKEN_ADDRESS_HERE',  color: '#9945FF', icon: '◈' },
+    ],
+
+    // Claim amount displayed in the UI (1000 tokens, matches contract)
+    CLAIM_DISPLAY: '1,000',
+
+    // 24-hour cooldown in ms (for local timer only — contract enforces on-chain)
+    COOLDOWN_MS: 86_400_000,
+  };
+</script>
+
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --orange: #F7931A;
+    --cyan:   #00D4FF;
+    --purple: #9945FF;
+    --green:  #00FF87;
+    --red:    #FF4444;
+    --bg:     #050810;
+    --surface: rgba(255,255,255,0.03);
+    --border:  rgba(255,255,255,0.07);
+  }
+
+  body {
+    background: var(--bg);
+    font-family: 'Share Tech Mono', monospace;
+    color: #fff;
+    min-height: 100vh;
+    overflow-x: hidden;
+  }
+
+  /* ── Background ── */
+  #bg-canvas { position:fixed; inset:0; pointer-events:none; z-index:0; }
+  .grid-overlay {
+    position:fixed; inset:0; pointer-events:none; z-index:0;
+    background-image:
+      linear-gradient(rgba(0,212,255,0.025) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(0,212,255,0.025) 1px, transparent 1px);
+    background-size: 60px 60px;
+  }
+  .orb { position:fixed; border-radius:50%; pointer-events:none; z-index:0; filter:blur(80px); }
+  .orb-1 { width:600px;height:600px;top:-200px;left:-150px; background:radial-gradient(circle,rgba(247,147,26,.12),transparent 70%); }
+  .orb-2 { width:600px;height:600px;bottom:-200px;right:-150px; background:radial-gradient(circle,rgba(153,69,255,.12),transparent 70%); }
+  .orb-3 { width:900px;height:400px;top:40%;left:50%;transform:translateX(-50%); background:radial-gradient(circle,rgba(0,212,255,.06),transparent 70%); }
+  .scanline {
+    position:fixed; left:0; width:100%; height:3px; z-index:1; pointer-events:none;
+    background:linear-gradient(transparent,rgba(0,212,255,.1),transparent);
+    animation: scan 10s linear infinite;
+  }
+  @keyframes scan { 0%{top:-10px} 100%{top:110vh} }
+
+  /* ── Layout ── */
+  .wrap { position:relative; z-index:2; max-width:1060px; margin:0 auto; padding:28px 20px 60px; }
+
+  /* ── Header ── */
+  header { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:16px; margin-bottom:28px; }
+  .logo  { display:flex; align-items:center; gap:14px; }
+  .logo-icon {
+    width:44px; height:44px; border-radius:10px; font-size:22px;
+    background:linear-gradient(135deg,var(--orange),var(--purple));
+    display:flex; align-items:center; justify-content:center; flex-shrink:0;
+    box-shadow:0 0 28px rgba(247,147,26,.5);
+  }
+  .logo-name { font-family:'Orbitron',sans-serif; font-size:20px; font-weight:900; letter-spacing:3px; }
+  .logo-name .o { color:var(--orange); }
+  .logo-name .c { color:var(--cyan); }
+  .logo-sub  { font-size:9px; color:rgba(0,212,255,.5); letter-spacing:4px; margin-top:3px; }
+
+  .header-right { display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+
+  .wallet-pill {
+    display:flex; align-items:center; gap:8px; padding:8px 16px;
+    border-radius:8px; background:rgba(0,212,255,.07); border:1px solid rgba(0,212,255,.2);
+    font-size:12px; color:rgba(0,212,255,.85);
+  }
+  .pulse { width:8px;height:8px; border-radius:50%; flex-shrink:0; animation:blink 2s infinite; }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+  .btn {
+    padding:11px 24px; border-radius:8px; border:none; cursor:pointer;
+    font-family:'Orbitron',sans-serif; font-size:11px; font-weight:900; letter-spacing:2px;
+    transition:transform .2s, filter .2s;
+  }
+  .btn:hover:not(:disabled) { transform:scale(1.04); filter:brightness(1.15); }
+  .btn:disabled { opacity:.5; cursor:not-allowed; }
+  .btn-primary { background:linear-gradient(135deg,var(--orange),#FF6B35); color:#000; box-shadow:0 0 28px rgba(247,147,26,.4); }
+  .btn-danger  { background:rgba(255,68,68,.12); border:1px solid rgba(255,68,68,.35); color:#FF7070; font-family:'Share Tech Mono',monospace; }
+  .btn-hero    { padding:14px 40px; border-radius:10px; font-size:13px; box-shadow:0 0 40px rgba(247,147,26,.4); }
+
+  /* ── Net badge ── */
+  .net-badge {
+    display:inline-flex; align-items:center; gap:10px; padding:9px 16px;
+    background:rgba(0,255,135,.05); border:1px solid rgba(0,255,135,.2);
+    border-radius:8px; margin-bottom:28px; font-size:10px; color:var(--green); letter-spacing:3px;
+  }
+  .net-badge .dim { color:rgba(255,255,255,.3); }
+
+  /* ── Hero ── */
+  .hero {
+    margin-bottom:36px; padding:44px 32px; border-radius:18px; text-align:center;
+    background:linear-gradient(135deg,rgba(247,147,26,.07),rgba(153,69,255,.07));
+    border:1px solid rgba(247,147,26,.18); position:relative; overflow:hidden;
+  }
+  .hero::before {
+    content:''; position:absolute; inset:0;
+    background: radial-gradient(circle at 30% 50%,rgba(247,147,26,.06),transparent 60%),
+                radial-gradient(circle at 70% 50%,rgba(153,69,255,.06),transparent 60%);
+  }
+  .hero > * { position:relative; z-index:1; }
+  .hero-icon { font-size:52px; margin-bottom:14px; display:block; }
+  .hero h1 {
+    font-family:'Orbitron',sans-serif; font-size:clamp(20px,4vw,30px); font-weight:900;
+    letter-spacing:3px; margin-bottom:12px;
+    background:linear-gradient(90deg,var(--orange),var(--cyan));
+    -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text;
+  }
+  .hero p { color:rgba(255,255,255,.45); font-size:13px; max-width:480px; margin:0 auto 24px; line-height:1.7; }
+
+  /* ── Portfolio ── */
+  .portfolio { margin-bottom:28px; padding:20px 24px; border-radius:14px; background:var(--surface); border:1px solid var(--border); }
+  .sec-label { font-size:9px; color:rgba(255,255,255,.25); letter-spacing:4px; margin-bottom:18px; }
+  .port-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:16px; }
+  .port-item { text-align:center; }
+  .port-sym  { font-size:10px; color:rgba(255,255,255,.3); letter-spacing:3px; margin-bottom:4px; }
+  .port-val  { font-family:'Orbitron',sans-serif; font-size:20px; font-weight:900; }
+
+  /* ── Cards ── */
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(290px,1fr)); gap:20px; margin-bottom:36px; }
+  .card {
+    border-radius:16px; overflow:hidden;
+    background:linear-gradient(160deg,rgba(255,255,255,.045),rgba(255,255,255,.01));
+    border:1px solid var(--border);
+    transition:transform .35s cubic-bezier(.34,1.56,.64,1), box-shadow .3s;
+  }
+  .card:hover { transform:translateY(-5px) scale(1.01); }
+  .card-top   { height:3px; }
+  .card-body  { padding:24px; }
+
+  .card-head { display:flex; align-items:center; justify-content:space-between; margin-bottom:20px; }
+  .tok-info  { display:flex; align-items:center; gap:12px; }
+  .tok-icon  { width:50px;height:50px; border-radius:13px; display:flex; align-items:center; justify-content:center; font-size:24px; flex-shrink:0; }
+  .tok-name  { font-family:'Orbitron',sans-serif; font-size:14px; font-weight:700; letter-spacing:1px; }
+  .tok-sym   { font-size:10px; color:rgba(255,255,255,.35); letter-spacing:3px; margin-top:3px; }
+
+  .bal-box { text-align:right; }
+  .bal-lbl { font-size:8px; color:rgba(255,255,255,.3); letter-spacing:2px; margin-bottom:3px; }
+  .bal-val { font-family:'Orbitron',sans-serif; font-size:18px; font-weight:900; }
+
+  .stat-row { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-bottom:18px; }
+  .stat-box { padding:10px 12px; border-radius:8px; background:rgba(255,255,255,.03); border:1px solid rgba(255,255,255,.05); }
+  .stat-lbl { font-size:8px; color:rgba(255,255,255,.3); letter-spacing:2px; margin-bottom:4px; }
+  .stat-val { font-size:12px; color:rgba(255,255,255,.7); font-weight:700; }
+
+  .cd-bar { display:flex; align-items:center; gap:10px; padding:10px 14px; border-radius:8px; margin-bottom:16px; }
+  .cd-bar.waiting { background:rgba(255,160,0,.08); border:1px solid rgba(255,160,0,.2); }
+  .cd-bar.ready   { background:rgba(0,255,135,.07); border:1px solid rgba(0,255,135,.2); color:var(--green); font-size:11px; font-weight:700; letter-spacing:2px; }
+  .cd-lbl   { font-size:8px; color:rgba(255,255,255,.3); letter-spacing:2px; margin-bottom:2px; }
+  .cd-timer { font-family:'Orbitron',sans-serif; font-size:14px; font-weight:800; color:#FFB347; letter-spacing:2px; }
+
+  /* Claim button */
+  .btn-claim {
+    width:100%; padding:14px; border-radius:10px; border:none; cursor:pointer;
+    font-family:'Orbitron',sans-serif; font-size:12px; font-weight:900; letter-spacing:2px;
+    display:flex; align-items:center; justify-content:center; gap:8px;
+    transition:transform .2s, filter .2s;
+  }
+  .btn-claim:hover:not(:disabled):not(.loading) { transform:scale(1.04); filter:brightness(1.2); }
+  .btn-claim:disabled { cursor:not-allowed; }
+  .spinner { width:14px;height:14px; border-radius:50%; border:2px solid; border-top-color:transparent; animation:spin .8s linear infinite; }
+  @keyframes spin { to{transform:rotate(360deg)} }
+
+  /* ── Info grid ── */
+  .info-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:16px; margin-bottom:40px; }
+  .info-card { padding:22px 18px; border-radius:12px; background:var(--surface); border:1px solid var(--border); text-align:center; }
+  .info-icon  { font-size:30px; margin-bottom:10px; }
+  .info-title { font-family:'Orbitron',sans-serif; font-size:11px; font-weight:700; letter-spacing:1px; margin-bottom:8px; color:rgba(255,255,255,.85); }
+  .info-desc  { font-size:11px; color:rgba(255,255,255,.3); line-height:1.6; }
+
+  /* ── Footer ── */
+  footer { text-align:center; padding-top:24px; border-top:1px solid var(--border); font-size:10px; color:rgba(255,255,255,.18); letter-spacing:3px; }
+
+  /* ── Notifications ── */
+  #notifs { position:fixed; top:20px; right:20px; z-index:1000; display:flex; flex-direction:column; gap:10px; pointer-events:none; max-width:340px; }
+  .notif { padding:14px 20px; border-radius:10px; font-size:13px; font-weight:700; backdrop-filter:blur(20px); animation:slideIn .3s ease; pointer-events:auto; }
+  .notif.success { background:rgba(0,212,255,.13); border:1px solid var(--cyan); color:var(--cyan); }
+  .notif.error   { background:rgba(255,68,68,.13);  border:1px solid var(--red); color:#FF7070; }
+  .notif.info    { background:rgba(153,69,255,.13); border:1px solid var(--purple); color:#BB88FF; }
+  .notif.warn    { background:rgba(255,160,0,.13);  border:1px solid #FFA040; color:#FFB347; }
+  .notif.out { animation:slideOut .35s ease forwards; }
+  @keyframes slideIn  { from{opacity:0;transform:translateX(100px)} to{opacity:1;transform:translateX(0)} }
+  @keyframes slideOut { from{opacity:1;transform:translateX(0)} to{opacity:0;transform:translateX(100px)} }
+
+  /* ── Wallet-not-found banner ── */
+  .warn-banner {
+    margin-bottom:28px; padding:14px 20px; border-radius:10px;
+    background:rgba(255,160,0,.08); border:1px solid rgba(255,160,0,.3);
+    color:#FFB347; font-size:12px; display:flex; align-items:center; gap:10px;
+  }
+  .warn-banner a { color:var(--orange); }
+
+  /* ── Utility ── */
+  .hidden { display:none !important; }
+  @media(max-width:520px) {
+    .port-val { font-size:14px; }
+    .hero { padding:30px 16px; }
+    header { flex-direction:column; align-items:flex-start; }
+  }
+</style>
+</head>
+<body>
+
+<canvas id="bg-canvas"></canvas>
+<div class="grid-overlay"></div>
+<div class="orb orb-1"></div>
+<div class="orb orb-2"></div>
+<div class="orb orb-3"></div>
+<div class="scanline"></div>
+<div id="notifs"></div>
+
+<div class="wrap">
+
+  <!-- ── Header ── -->
+  <header>
+    <div class="logo">
+      <div class="logo-icon">⟠</div>
+      <div>
+        <div class="logo-name"><span class="o">OP</span>NET <span class="c">FAUCET</span></div>
+        <div class="logo-sub">Bitcoin Regtest Dispenser</div>
+      </div>
+    </div>
+    <div class="header-right">
+      <div class="wallet-pill hidden" id="wallet-pill">
+        <div class="pulse" style="background:var(--green);box-shadow:0 0 8px var(--green)"></div>
+        <span id="wallet-addr-display">—</span>
+      </div>
+      <button class="btn btn-primary" id="btn-main" onclick="handleWalletBtn()">CONNECT WALLET</button>
+    </div>
+  </header>
+
+  <!-- ── Network badge ── -->
+  <div class="net-badge">
+    <div class="pulse" style="background:var(--green);box-shadow:0 0 8px var(--green)"></div>
+    BITCOIN REGTEST NETWORK
+    <span class="dim">•</span>
+    <span class="dim" style="letter-spacing:2px">OP_NET WALLET ONLY</span>
+  </div>
+
+  <!-- ── OP_WALLET not installed warning ── -->
+  <div class="warn-banner hidden" id="no-wallet-banner">
+    ⚠ &nbsp; OP_WALLET extension not detected.
+    <a href="https://chromewebstore.google.com/detail/opwallet/pmbjpcmaaladnfpacpmhmnfmpklgbdjb" target="_blank">Install OP_WALLET →</a>
+    &nbsp;then reload this page.
+  </div>
+
+  <!-- ── Hero (disconnected state) ── -->
+  <div class="hero" id="hero">
+    <span class="hero-icon">🚰</span>
+    <h1>GET FREE TEST TOKENS</h1>
+    <p>Connect your OP_NET wallet to claim test tokens on Bitcoin Regtest. Each token can be claimed once every 24 hours.</p>
+    <button class="btn btn-primary btn-hero" onclick="handleWalletBtn()">CONNECT OP_NET WALLET</button>
+  </div>
+
+  <!-- ── Portfolio (connected state) ── -->
+  <div class="portfolio hidden" id="portfolio">
+    <div class="sec-label">▸ Portfolio Overview</div>
+    <div class="port-grid" id="port-grid"><!-- filled by JS --></div>
+  </div>
+
+  <!-- ── Token cards ── -->
+  <div class="cards" id="cards"></div>
+
+  <!-- ── Info strip ── -->
+  <div class="info-grid">
+    <div class="info-card">
+      <div class="info-icon">🔐</div>
+      <div class="info-title">On-Chain Cooldown</div>
+      <div class="info-desc">24-hour lock enforced by the FaucetDispenser smart contract — not just the UI</div>
+    </div>
+    <div class="info-card">
+      <div class="info-icon">⚡</div>
+      <div class="info-title">Instant Delivery</div>
+      <div class="info-desc">Tokens minted directly to your wallet address on-chain</div>
+    </div>
+    <div class="info-card">
+      <div class="info-icon">🔗</div>
+      <div class="info-title">Bitcoin Regtest</div>
+      <div class="info-desc">Safe testing environment — no real Bitcoin at risk</div>
+    </div>
+  </div>
+
+  <footer>OPNET FAUCET DISPENSER &nbsp;•&nbsp; BITCOIN REGTEST &nbsp;•&nbsp; OP_NET WALLET ONLY</footer>
+</div>
+
+<!-- ═════════════════════════════════════════════════════════════════════════
+     OP_NET SDK (CDN build — or replace with your bundled build)
+     ═════════════════════════════════════════════════════════════════════════ -->
+<!--
+  NOTE: OP_NET does not currently publish a standalone browser-ready CDN bundle.
+  The recommended approach is to bundle it with Vite/Webpack:
+      npm install opnet @btc-vision/transaction @btc-vision/bitcoin
+  and import in your JS.
+
+  For a quick local test WITHOUT bundling, the wallet provider (window.opnet)
+  injected by OP_WALLET extension is enough for connect/sign — which is
+  what the code below uses. Full contract reads use our RPC helper.
+-->
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   STATE
+═══════════════════════════════════════════════════════════════════════════ */
+const CFG = window.FAUCET_CONFIG;
+
+let state = {
+  connected:   false,
+  wallet:      null,    // { address, publicKey }
+  balances:    {},      // tokenId → string
+  lastClaims:  {},      // tokenId → unix-seconds (from contract)
+  claiming:    {},      // tokenId → bool
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ANIMATED CANVAS BACKGROUND
+═══════════════════════════════════════════════════════════════════════════ */
+(function () {
+  const canvas = document.getElementById('bg-canvas');
+  const ctx    = canvas.getContext('2d');
+  const COLORS = ['#F7931A','#00D4FF','#9945FF'];
+  let W, H, pts;
+  function init() {
+    W = canvas.width  = window.innerWidth;
+    H = canvas.height = window.innerHeight;
+    pts = Array.from({length:50}, () => ({
+      x: Math.random()*W, y: Math.random()*H,
+      r: Math.random()*2+.5,
+      vx:(Math.random()-.5)*.3, vy:(Math.random()-.5)*.3,
+      color: COLORS[Math.floor(Math.random()*3)],
+      alpha: Math.random()*.5+.1,
+    }));
+  }
+  function draw() {
+    ctx.clearRect(0,0,W,H);
+    pts.forEach(p => {
+      p.x = (p.x+p.vx+W)%W;
+      p.y = (p.y+p.vy+H)%H;
+      ctx.beginPath(); ctx.arc(p.x,p.y,p.r,0,Math.PI*2);
+      ctx.globalAlpha = p.alpha;
+      ctx.fillStyle   = p.color;
+      ctx.shadowBlur  = p.r*6; ctx.shadowColor = p.color;
+      ctx.fill();
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    });
+    requestAnimationFrame(draw);
+  }
+  init(); draw();
+  window.addEventListener('resize', init);
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   NOTIFICATIONS
+═══════════════════════════════════════════════════════════════════════════ */
+function notify(msg, type='success', dur=5000) {
+  const wrap = document.getElementById('notifs');
+  const el   = document.createElement('div');
+  el.className = `notif ${type}`;
+  el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(() => {
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 380);
+  }, dur);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FORMAT HELPERS
+═══════════════════════════════════════════════════════════════════════════ */
+function fmtAddr(a) {
+  return a ? a.slice(0,10)+'…'+a.slice(-8) : '—';
+}
+function fmtBalance(raw) {
+  if (!raw || raw === '0') return '0';
+  // raw is in 10^18 units; divide and format
+  const decimals = 18;
+  const s = raw.toString().padStart(decimals+1,'0');
+  const whole = s.slice(0, s.length-decimals) || '0';
+  return Number(whole).toLocaleString();
+}
+function fmtCountdown(remainingSec) {
+  if (remainingSec <= 0) return '00:00:00';
+  const h = Math.floor(remainingSec/3600);
+  const m = Math.floor((remainingSec%3600)/60);
+  const s = remainingSec%60;
+  return [h,m,s].map(v=>String(v).padStart(2,'0')).join(':');
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   WALLET INTEGRATION  (window.opnet — injected by OP_WALLET extension)
+═══════════════════════════════════════════════════════════════════════════ */
+function hasWallet() { return typeof window.opnet !== 'undefined'; }
+
+async function handleWalletBtn() {
+  if (!hasWallet()) {
+    document.getElementById('no-wallet-banner').classList.remove('hidden');
+    notify('OP_WALLET extension not found. Please install it first.', 'error', 8000);
+    return;
+  }
+  if (state.connected) {
+    await disconnectWallet();
+  } else {
+    await connectWallet();
+  }
+}
+
+async function connectWallet() {
+  try {
+    notify('Requesting wallet access…', 'info', 3000);
+
+    // OP_WALLET injects window.opnet (mirrors MetaMask/Unisat patterns)
+    const accounts = await window.opnet.requestAccounts();
+    if (!accounts || accounts.length === 0) {
+      notify('No accounts returned — check OP_WALLET is set to Regtest.', 'error');
+      return;
+    }
+
+    const address   = accounts[0];
+    const publicKey = await window.opnet.getPublicKey();
+
+    state.wallet    = { address, publicKey };
+    state.connected = true;
+
+    // Update UI chrome
+    document.getElementById('wallet-addr-display').textContent = fmtAddr(address);
+    document.getElementById('wallet-pill').classList.remove('hidden');
+
+    const btn = document.getElementById('btn-main');
+    btn.textContent = 'DISCONNECT';
+    btn.classList.replace('btn-primary','btn-danger');
+
+    document.getElementById('hero').classList.add('hidden');
+    document.getElementById('portfolio').classList.remove('hidden');
+
+    notify('✓ OP_NET wallet connected!', 'success');
+
+    // Fetch on-chain balances + claim times
+    await refreshChainData();
+    renderCards();
+    renderPortfolio();
+
+  } catch (err) {
+    console.error(err);
+    notify('Connection failed: ' + (err.message || err), 'error');
+  }
+}
+
+async function disconnectWallet() {
+  state.connected  = false;
+  state.wallet     = null;
+  state.balances   = {};
+  state.lastClaims = {};
+
+  document.getElementById('wallet-pill').classList.add('hidden');
+  document.getElementById('portfolio').classList.add('hidden');
+  document.getElementById('hero').classList.remove('hidden');
+
+  const btn = document.getElementById('btn-main');
+  btn.textContent = 'CONNECT WALLET';
+  btn.classList.replace('btn-danger','btn-primary');
+
+  renderCards();
+  notify('Wallet disconnected.', 'info');
+}
+
+// Listen for account changes from the extension
+if (typeof window !== 'undefined') {
+  window.addEventListener('load', () => {
+    if (hasWallet()) {
+      document.getElementById('no-wallet-banner').classList.add('hidden');
+      window.opnet.on?.('accountsChanged', (accs) => {
+        if (accs && accs.length > 0 && state.connected) {
+          state.wallet.address = accs[0];
+          document.getElementById('wallet-addr-display').textContent = fmtAddr(accs[0]);
+          refreshChainData().then(() => { renderCards(); renderPortfolio(); });
+          notify('Account changed — refreshing data.', 'info');
+        } else {
+          disconnectWallet();
+        }
+      });
+    } else {
+      document.getElementById('no-wallet-banner').classList.remove('hidden');
+    }
+    renderCards(); // Render empty state
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ON-CHAIN DATA  (OP_NET JSON-RPC via fetch)
+═══════════════════════════════════════════════════════════════════════════ */
+let rpcId = 1;
+
+async function rpcCall(method, params) {
+  const res = await fetch(CFG.RPC_URL, {
+    method:  'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body:    JSON.stringify({ jsonrpc:'2.0', id: rpcId++, method, params }),
+  });
+  const data = await res.json();
+  if (data.error) throw new Error(data.error.message);
+  return data.result;
+}
+
+/**
+ * Call a view function on an OP_NET contract (no signing needed).
+ * Uses btc_call (simulate read-only execution).
+ */
+async function contractCall(contractAddress, calldata) {
+  return rpcCall('btc_call', [{
+    to:   contractAddress,
+    data: calldata,
+    from: state.wallet?.address || contractAddress,
+  }]);
+}
+
+/** Build 4-byte selector: keccak256(sig)[0..3] as hex */
+function selector(sig) {
+  // Simple djb2-based selector compatible with OP_NET's encodeSelector
+  // For production use the actual keccak256; here we use the known selectors
+  const SELECTORS = {
+    'balanceOf(address)':     '0x70a08231',
+    'nextClaimTime(uint8)':   '0x5f8aabf0',
+  };
+  return SELECTORS[sig] || '0x00000000';
+}
+
+function addressToHex(addr) {
+  // Strip bc1/bcrt prefix and convert bech32 → 32-byte padded hex for calldata
+  // OP_NET stores addresses as 32-byte padded values.
+  // In practice you'd use the address library; we pass the raw string and
+  // let the RPC decode it.
+  return addr;
+}
+
+async function fetchBalance(tokenAddress) {
+  if (!state.wallet) return '0';
+  try {
+    // OP_NET RPC: op_20_balanceOf
+    const result = await rpcCall('op_20_balanceOf', [tokenAddress, state.wallet.address]);
+    return result?.balance || '0';
+  } catch (e) {
+    console.warn('fetchBalance error', e);
+    return '0';
+  }
+}
+
+async function fetchNextClaimTime(tokenIndex) {
+  if (!state.wallet) return 0;
+  try {
+    const result = await rpcCall('faucet_nextClaimTime', [CFG.FAUCET_CONTRACT, state.wallet.address, tokenIndex]);
+    return Number(result?.nextClaimTime || 0);
+  } catch (e) {
+    // Fallback — use local storage as approximation
+    const key = `opnet_faucet_claim_${state.wallet.address}_${tokenIndex}`;
+    const saved = localStorage.getItem(key);
+    return saved ? Number(saved) + 86400 : 0;
+  }
+}
+
+async function refreshChainData() {
+  if (!state.connected) return;
+  try {
+    const promises = CFG.TOKENS.map(async (tok, i) => {
+      const [bal, nextTime] = await Promise.all([
+        fetchBalance(tok.address),
+        fetchNextClaimTime(i),
+      ]);
+      state.balances[tok.id]   = bal;
+      state.lastClaims[tok.id] = nextTime;  // unix seconds when next claim allowed
+    });
+    await Promise.all(promises);
+  } catch (err) {
+    console.warn('refreshChainData error:', err);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CLAIM
+═══════════════════════════════════════════════════════════════════════════ */
+async function claim(tokenIndex) {
+  const tok = CFG.TOKENS[tokenIndex];
+  if (!state.connected) { notify('Connect your wallet first.', 'error'); return; }
+
+  const nowSec    = Math.floor(Date.now()/1000);
+  const nextTime  = state.lastClaims[tok.id] || 0;
+
+  if (nextTime > nowSec) {
+    const rem = nextTime - nowSec;
+    notify(`⏳ ${tok.symbol} cooldown: ${fmtCountdown(rem)} remaining`, 'warn');
+    return;
+  }
+
+  state.claiming[tok.id] = true;
+  renderCards();
+
+  try {
+    notify(`Sending ${tok.symbol} claim transaction…`, 'info', 4000);
+
+    // Build calldata for claim(uint8 tokenIndex)
+    // Selector: encodeSelector('claim(uint8)') — 4 bytes + 1 byte padded to 32
+    const claimSel   = '0x4e71d92d'; // keccak256('claim(uint8)')[0:4]
+    const indexHex   = tokenIndex.toString(16).padStart(64, '0');
+    const calldata   = claimSel + indexHex;
+
+    // Ask OP_WALLET to sign and broadcast the transaction
+    const txParams = {
+      to:                       CFG.FAUCET_CONTRACT,
+      data:                     calldata,
+      maximumAllowedSatToSpend: '50000',  // 0.0005 BTC max fee
+      feeRate:                  10,
+    };
+
+    const txResult = await window.opnet.sendTransaction(txParams);
+
+    if (!txResult || !txResult.txid) throw new Error('No txid returned');
+
+    notify(`🎉 Claimed ${CFG.CLAIM_DISPLAY} ${tok.symbol}! TX: ${txResult.txid.slice(0,16)}…`, 'success', 8000);
+
+    // Optimistically update local state
+    const claimTs = Math.floor(Date.now()/1000);
+    state.lastClaims[tok.id] = claimTs + 86400;
+
+    // Persist locally as fallback for next-claim time
+    const key = `opnet_faucet_claim_${state.wallet.address}_${tokenIndex}`;
+    localStorage.setItem(key, String(claimTs));
+
+    // Wait a moment then refresh balances from chain
+    setTimeout(async () => {
+      await refreshChainData();
+      renderCards();
+      renderPortfolio();
+    }, 3000);
+
+  } catch (err) {
+    console.error(err);
+    const msg = err.message || String(err);
+    if (msg.includes('cooldown') || msg.includes('24h')) {
+      notify(`Claim rejected: 24-hour cooldown not elapsed on-chain.`, 'error');
+    } else if (msg.includes('User rejected') || msg.includes('cancel')) {
+      notify('Transaction cancelled.', 'warn');
+    } else {
+      notify(`Claim failed: ${msg.slice(0,80)}`, 'error');
+    }
+  } finally {
+    state.claiming[tok.id] = false;
+    renderCards();
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   RENDER
+═══════════════════════════════════════════════════════════════════════════ */
+function renderPortfolio() {
+  const grid = document.getElementById('port-grid');
+  grid.innerHTML = CFG.TOKENS.map(tok => `
+    <div class="port-item">
+      <div class="port-sym">${tok.symbol}</div>
+      <div class="port-val" style="color:${tok.color};text-shadow:0 0 20px ${tok.color}80" id="pv-${tok.id}">
+        ${fmtBalance(state.balances[tok.id] || '0')}
+      </div>
+    </div>
+  `).join('');
+}
+
+function remainingSec(tokenId) {
+  const nowSec   = Math.floor(Date.now()/1000);
+  const nextTime = state.lastClaims[tokenId] || 0;
+  return Math.max(0, nextTime - nowSec);
+}
+
+function renderCards() {
+  const wrap = document.getElementById('cards');
+  wrap.innerHTML = '';
+
+  CFG.TOKENS.forEach((tok, i) => {
+    const remSec    = remainingSec(tok.id);
+    const available = state.connected && remSec === 0;
+    const isClaiming = state.claiming[tok.id];
+    const bal       = fmtBalance(state.balances[tok.id] || '0');
+
+    // ── Cooldown / ready bar ──
+    let statusHtml = '';
+    if (state.connected && !isClaiming) {
+      if (!available) {
+        statusHtml = `
+          <div class="cd-bar waiting">
+            <span>⏱</span>
+            <div>
+              <div class="cd-lbl">NEXT CLAIM</div>
+              <div class="cd-timer" id="cd-${tok.id}">${fmtCountdown(remSec)}</div>
+            </div>
+          </div>`;
+      } else {
+        statusHtml = `
+          <div class="cd-bar ready">
+            <div class="pulse" style="background:var(--green);box-shadow:0 0 8px var(--green);flex-shrink:0"></div>
+            READY TO CLAIM
+          </div>`;
+      }
+    }
+
+    // ── Claim button ──
+    let btnStyle, btnText, btnDisabled;
+    if (!state.connected) {
+      btnStyle   = 'background:rgba(255,255,255,.05);color:rgba(255,255,255,.3);border:1px solid rgba(255,255,255,.07)';
+      btnText    = 'CONNECT WALLET';
+      btnDisabled = 'disabled';
+    } else if (isClaiming) {
+      btnStyle   = `background:linear-gradient(135deg,${tok.color}55,${tok.color}22);color:rgba(0,0,0,.4)`;
+      btnText    = `<div class="spinner" style="border-color:${tok.color}"></div> PROCESSING…`;
+      btnDisabled = 'disabled';
+    } else if (available) {
+      btnStyle   = `background:linear-gradient(135deg,${tok.color},${tok.color}BB);color:#000;box-shadow:0 0 30px ${tok.color}55`;
+      btnText    = `CLAIM ${tok.symbol}`;
+      btnDisabled = '';
+    } else {
+      btnStyle   = 'background:rgba(255,255,255,.04);color:rgba(255,255,255,.25);border:1px solid rgba(255,255,255,.05)';
+      btnText    = 'ON COOLDOWN';
+      btnDisabled = 'disabled';
+    }
+
+    // ── Balance block (only when connected) ──
+    const balHtml = state.connected ? `
+      <div class="bal-box">
+        <div class="bal-lbl">BALANCE</div>
+        <div class="bal-val" style="color:${tok.color};text-shadow:0 0 18px ${tok.color}88">${bal}</div>
+      </div>` : '';
+
+    const cardBorder = available && state.connected
+      ? `border-color:${tok.color}55;box-shadow:0 0 40px ${tok.color}18`
+      : '';
+
+    const card = document.createElement('div');
+    card.className = 'card';
+    card.style.cssText = cardBorder;
+    card.innerHTML = `
+      <div class="card-top" style="background:linear-gradient(90deg,${tok.color},transparent)"></div>
+      <div class="card-body">
+        <div class="card-head">
+          <div class="tok-info">
+            <div class="tok-icon" style="background:linear-gradient(135deg,${tok.color}28,${tok.color}0a);border:1px solid ${tok.color}40;box-shadow:0 0 20px ${tok.color}28">
+              ${tok.icon}
+            </div>
+            <div>
+              <div class="tok-name">${tok.name}</div>
+              <div class="tok-sym">${tok.symbol}</div>
+            </div>
+          </div>
+          ${balHtml}
+        </div>
+
+        <div class="stat-row">
+          <div class="stat-box">
+            <div class="stat-lbl">TOTAL SUPPLY</div>
+            <div class="stat-val">1,000,000,000</div>
+          </div>
+          <div class="stat-box">
+            <div class="stat-lbl">PER CLAIM</div>
+            <div class="stat-val">${CFG.CLAIM_DISPLAY}</div>
+          </div>
+        </div>
+
+        ${statusHtml}
+
+        <button class="btn-claim" style="${btnStyle}" ${btnDisabled} onclick="claim(${i})">
+          ${btnText}
+        </button>
+      </div>
+    `;
+    wrap.appendChild(card);
+  });
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LIVE COUNTDOWN TICK  (every second)
+═══════════════════════════════════════════════════════════════════════════ */
+setInterval(() => {
+  let needsRender = false;
+  CFG.TOKENS.forEach(tok => {
+    const el = document.getElementById(`cd-${tok.id}`);
+    if (el) {
+      const rem = remainingSec(tok.id);
+      el.textContent = fmtCountdown(rem);
+      if (rem === 0) needsRender = true; // cooldown just expired
+    }
+  });
+  if (needsRender) renderCards();
+}, 1000);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   INIT
+═══════════════════════════════════════════════════════════════════════════ */
+renderCards();
+</script>
+</body>
+</html>
